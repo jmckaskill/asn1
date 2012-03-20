@@ -96,6 +96,19 @@ func marshalBase128Int(out *forkableWriter, n int64) (err error) {
 	return nil
 }
 
+func marshalUint64(out *forkableWriter, u uint64) (err error) {
+	n := uint64Length(u)
+
+	for ; n > 0; n-- {
+		err = out.WriteByte(byte(u >> uint((n-1)*8)))
+		if err != nil {
+			return
+		}
+	}
+
+	return nil
+}
+
 func marshalInt64(out *forkableWriter, i int64) (err error) {
 	n := int64Length(i)
 
@@ -107,6 +120,17 @@ func marshalInt64(out *forkableWriter, i int64) (err error) {
 	}
 
 	return nil
+}
+
+func uint64Length(u uint64) (numBytes int) {
+	numBytes = 1
+
+	for u > 127 {
+		numBytes++
+		u >>= 8
+	}
+
+	return
 }
 
 func int64Length(i int64) (numBytes int) {
@@ -280,12 +304,23 @@ func marshalIA5String(out *forkableWriter, s string) (err error) {
 	return
 }
 
+func marshalGeneralString(out *forkableWriter, s string) (err error) {
+	_, err = out.Write([]byte(s))
+	return
+}
+
 func marshalTwoDigits(out *forkableWriter, v int) (err error) {
 	err = out.WriteByte(byte('0' + (v/10)%10))
 	if err != nil {
 		return
 	}
 	return out.WriteByte(byte('0' + v%10))
+}
+
+func marshalGeneralizedTime(out *forkableWriter, t time.Time) (err error) {
+	s := t.UTC().Format("20060102150405.000Z0700")
+	_, err = out.Write([]byte(s))
+	return
 }
 
 func marshalUTCTime(out *forkableWriter, t time.Time) (err error) {
@@ -372,7 +407,11 @@ func stripTagAndLength(in []byte) []byte {
 func marshalBody(out *forkableWriter, value reflect.Value, params fieldParameters) (err error) {
 	switch value.Type() {
 	case timeType:
-		return marshalUTCTime(out, value.Interface().(time.Time))
+		if params.timeType == tagGeneralizedTime {
+			return marshalGeneralizedTime(out, value.Interface().(time.Time))
+		} else {
+			return marshalUTCTime(out, value.Interface().(time.Time))
+		}
 	case bitStringType:
 		return marshalBitString(out, value.Interface().(BitString))
 	case objectIdentifierType:
@@ -390,6 +429,8 @@ func marshalBody(out *forkableWriter, value reflect.Value, params fieldParameter
 		}
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return marshalInt64(out, int64(v.Int()))
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return marshalUint64(out, v.Uint())
 	case reflect.Struct:
 		t := v.Type()
 
@@ -435,23 +476,27 @@ func marshalBody(out *forkableWriter, value reflect.Value, params fieldParameter
 			return
 		}
 
-		var params fieldParameters
+		var iparams fieldParameters
+		iparams.timeType = params.timeType
+		iparams.stringType = params.stringType
 		for i := 0; i < v.Len(); i++ {
 			var pre *forkableWriter
 			pre, out = out.fork()
-			err = marshalField(pre, v.Index(i), params)
+			err = marshalField(pre, v.Index(i), iparams)
 			if err != nil {
 				return
 			}
 		}
 		return
 	case reflect.String:
-		if params.stringType == tagIA5String {
+		switch params.stringType {
+		case tagGeneralString:
+			return marshalGeneralString(out, v.String())
+		case tagIA5String:
 			return marshalIA5String(out, v.String())
-		} else {
+		default:
 			return marshalPrintableString(out, v.String())
 		}
-		return
 	}
 
 	return StructuralError{"unknown Go type"}
@@ -463,8 +508,26 @@ func marshalField(out *forkableWriter, v reflect.Value, params fieldParameters) 
 		return marshalField(out, v.Elem(), params)
 	}
 
-	if params.optional && reflect.DeepEqual(v.Interface(), reflect.Zero(v.Type()).Interface()) {
-		return
+	if params.optional {
+		if params.defaultValue != nil {
+			switch v.Kind() {
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+				if *params.defaultValue == v.Int() {
+					return
+				}
+			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+				if *params.defaultValue == int64(v.Uint()) {
+					return
+				}
+			}
+		} else if reflect.DeepEqual(v.Interface(), reflect.Zero(v.Type()).Interface()) {
+			return
+		}
+	}
+
+	var explicitTag *forkableWriter
+	if params.explicit {
+		explicitTag, out = out.fork()
 	}
 
 	if v.Type() == rawValueType {
@@ -478,60 +541,77 @@ func marshalField(out *forkableWriter, v reflect.Value, params fieldParameters) 
 			}
 			_, err = out.Write(rv.Bytes)
 		}
-		return
-	}
-
-	tag, isCompound, ok := getUniversalType(v.Type())
-	if !ok {
-		err = StructuralError{fmt.Sprintf("unknown Go type: %v", v.Type())}
-		return
-	}
-	class := classUniversal
-
-	if params.stringType != 0 {
-		if tag != tagPrintableString {
-			return StructuralError{"Explicit string type given to non-string member"}
+	} else {
+		tag, isCompound, ok := getUniversalType(v.Type())
+		if !ok {
+			err = StructuralError{fmt.Sprintf("unknown Go type: %v", v.Type())}
+			return
 		}
-		tag = params.stringType
-	}
+		class := classUniversal
 
-	if params.set {
-		if tag != tagSequence {
-			return StructuralError{"Non sequence tagged as set"}
+		if params.timeType != 0 {
+			switch tag {
+			case tagUTCTime:
+				tag = params.timeType
+			case tagSequence:
+				// Used to alter the inner element types
+			default:
+				return StructuralError{"Explicit time type given to non-time member"}
+			}
 		}
-		tag = tagSet
+
+		if params.stringType != 0 {
+			switch tag {
+			case tagPrintableString:
+				tag = params.stringType
+			case tagSequence:
+				// Used to alter the inner element types
+			default:
+				return StructuralError{"Explicit string type given to non-string member"}
+			}
+		}
+
+		if params.set {
+			if tag != tagSequence {
+				return StructuralError{"Non sequence tagged as set"}
+			}
+			tag = tagSet
+		}
+
+		tags, body := out.fork()
+
+		err = marshalBody(body, v, params)
+		if err != nil {
+			return
+		}
+
+		if !params.explicit && params.tag != nil {
+			// implicit tag.
+			tag = *params.tag
+			if params.application {
+				class = classApplication
+			} else {
+				class = classContextSpecific
+			}
+		}
+
+		err = marshalTagAndLength(tags, tagAndLength{class, tag, body.Len(), isCompound})
+		if err != nil {
+			return
+		}
 	}
 
-	tags, body := out.fork()
-
-	err = marshalBody(body, v, params)
-	if err != nil {
-		return
-	}
-
-	bodyLen := body.Len()
-
-	var explicitTag *forkableWriter
 	if params.explicit {
-		explicitTag, tags = tags.fork()
-	}
-
-	if !params.explicit && params.tag != nil {
-		// implicit tag.
-		tag = *params.tag
-		class = classContextSpecific
-	}
-
-	err = marshalTagAndLength(tags, tagAndLength{class, tag, bodyLen, isCompound})
-	if err != nil {
-		return
-	}
-
-	if params.explicit {
+		var class int
+		if params.application {
+			class = classApplication
+		} else {
+			class = classContextSpecific
+		}
 		err = marshalTagAndLength(explicitTag, tagAndLength{
-			class:      classContextSpecific,
+			class:      class,
 			tag:        *params.tag,
-			length:     bodyLen + tags.Len(),
+			length:     out.Len(),
 			isCompound: true,
 		})
 	}
@@ -541,13 +621,18 @@ func marshalField(out *forkableWriter, v reflect.Value, params fieldParameters) 
 
 // Marshal returns the ASN.1 encoding of val.
 func Marshal(val interface{}) ([]byte, error) {
+	return MarshalWithParams(val, "")
+}
+
+func MarshalWithParams(val interface{}, params string) ([]byte, error) {
 	var out bytes.Buffer
 	v := reflect.ValueOf(val)
 	f := newForkableWriter()
-	err := marshalField(f, v, fieldParameters{})
+	err := marshalField(f, v, parseFieldParameters(params))
 	if err != nil {
 		return nil, err
 	}
 	_, err = f.writeTo(&out)
 	return out.Bytes(), nil
 }
+

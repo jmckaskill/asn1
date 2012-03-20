@@ -56,6 +56,18 @@ func parseBool(bytes []byte) (ret bool, err error) {
 
 // INTEGER
 
+func parseUint64(bytes []byte) (ret uint64, err error) {
+	for bytesRead := 0; bytesRead < len(bytes); bytesRead++ {
+		if ret >= 0x0100000000000000 {
+			return 0, StructuralError{"integer too large"}
+		}
+		ret <<= 8
+		ret |= uint64(bytes[bytesRead])
+	}
+
+	return
+}
+
 // parseInt64 treats the given bytes as a big-endian, signed integer and
 // returns the result.
 func parseInt64(bytes []byte) (ret int64, err error) {
@@ -326,6 +338,16 @@ func parseUTF8String(bytes []byte) (ret string, err error) {
 	return string(bytes), nil
 }
 
+// GeneralString
+
+// parseGeneralString parses a ASN.1 GeneralString from the given byte array
+// and returns it. GeneralString is specified in ISO-2022/ECMA-35, A brief
+// review suggests that it includes structures that allow the encoding to
+// change midstring and such. We give up and pass it as an 8-bit string.
+func parseGeneralString(bytes []byte) (ret string, err error) {
+	return string(bytes), nil
+}
+
 // A RawValue represents an undecoded ASN.1 object.
 type RawValue struct {
 	Class, Tag int
@@ -373,11 +395,6 @@ func parseTagAndLength(bytes []byte, initOffset int) (ret tagAndLength, offset i
 	} else {
 		// Bottom 7 bits give the number of length bytes to follow.
 		numBytes := int(b & 0x7f)
-		// We risk overflowing a signed 32-bit number if we accept more than 3 bytes.
-		if numBytes > 3 {
-			err = StructuralError{"length too large"}
-			return
-		}
 		if numBytes == 0 {
 			err = SyntaxError{"indefinite length found (not DER)"}
 			return
@@ -386,6 +403,10 @@ func parseTagAndLength(bytes []byte, initOffset int) (ret tagAndLength, offset i
 		for i := 0; i < numBytes; i++ {
 			if offset >= len(bytes) {
 				err = SyntaxError{"truncated tag or length"}
+				return
+			}
+			if ret.length > (maxLength >> 8) {
+				err = StructuralError{"length too large"}
 				return
 			}
 			b = bytes[offset]
@@ -417,11 +438,19 @@ func parseSequenceOf(bytes []byte, sliceType reflect.Type, elemType reflect.Type
 		if err != nil {
 			return
 		}
-		// We pretend that GENERAL STRINGs are PRINTABLE STRINGs so
-		// that a sequence of them can be parsed into a []string.
-		if t.tag == tagGeneralString {
+
+		// Special case for strings and time: all the ASN.1 string
+		// types map to the Go type string. getUniversalType returns
+		// the tag for PrintableString when it sees a string, so if we
+		// see a different string type on the wire, we change the
+		// universal type to match. Similarly for time.
+		switch t.tag {
+		case tagIA5String, tagGeneralString, tagT61String, tagUTF8String:
 			t.tag = tagPrintableString
+		case tagGeneralizedTime:
+			t.tag = tagUTCTime
 		}
+
 		if t.class != classUniversal || t.isCompound != compoundType || t.tag != expectedTag {
 			err = StructuralError{"sequence tag mismatch"}
 			return
@@ -477,18 +506,56 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 		return
 	}
 
+	tagOffset := offset
+	t, offset, err := parseTagAndLength(bytes, offset)
+	if err != nil {
+		return
+	}
+	if invalidLength(offset, t.length, len(bytes)) {
+		err = SyntaxError{"data truncated"}
+		return
+	}
+
+	// Unwrap the outer tag
+	if params.explicit {
+		expectedClass := classContextSpecific
+		if params.application {
+			expectedClass = classApplication
+		}
+		if t.class == expectedClass && t.tag == *params.tag && (t.length == 0 || t.isCompound) {
+			if t.length > 0 {
+				tagOffset = offset
+				t, offset, err = parseTagAndLength(bytes, offset)
+				if err != nil {
+					return
+				}
+				if invalidLength(offset, t.length, len(bytes)) {
+					err = SyntaxError{"data truncated"}
+					return
+				}
+			} else {
+				if fieldType != flagType {
+					err = StructuralError{"Zero length explicit tag was not an asn1.Flag"}
+					return
+				}
+				v.SetBool(true)
+				return
+			}
+		} else {
+			// The tags didn't match, it might be an optional element.
+			ok := setDefaultValue(v, params)
+			if ok {
+				offset = initOffset
+			} else {
+				err = StructuralError{"explicitly tagged member didn't match"}
+			}
+			return
+		}
+	}
+
 	// Deal with raw values.
 	if fieldType == rawValueType {
-		var t tagAndLength
-		t, offset, err = parseTagAndLength(bytes, offset)
-		if err != nil {
-			return
-		}
-		if invalidLength(offset, t.length, len(bytes)) {
-			err = SyntaxError{"data truncated"}
-			return
-		}
-		result := RawValue{t.class, t.tag, t.isCompound, bytes[offset : offset+t.length], bytes[initOffset : offset+t.length]}
+		result := RawValue{t.class, t.tag, t.isCompound, bytes[offset : offset+t.length], bytes[tagOffset : offset+t.length]}
 		offset += t.length
 		v.Set(reflect.ValueOf(result))
 		return
@@ -496,19 +563,12 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 
 	// Deal with the ANY type.
 	if ifaceType := fieldType; ifaceType.Kind() == reflect.Interface && ifaceType.NumMethod() == 0 {
-		var t tagAndLength
-		t, offset, err = parseTagAndLength(bytes, offset)
-		if err != nil {
-			return
-		}
-		if invalidLength(offset, t.length, len(bytes)) {
-			err = SyntaxError{"data truncated"}
-			return
-		}
 		var result interface{}
 		if !t.isCompound && t.class == classUniversal {
 			innerBytes := bytes[offset : offset+t.length]
 			switch t.tag {
+			case tagGeneralString:
+				result, err = parseGeneralString(innerBytes)
 			case tagPrintableString:
 				result, err = parsePrintableString(innerBytes)
 			case tagIA5String:
@@ -540,45 +600,11 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 		}
 		return
 	}
+
 	universalTag, compoundType, ok1 := getUniversalType(fieldType)
 	if !ok1 {
 		err = StructuralError{fmt.Sprintf("unknown Go type: %v", fieldType)}
 		return
-	}
-
-	t, offset, err := parseTagAndLength(bytes, offset)
-	if err != nil {
-		return
-	}
-	if params.explicit {
-		expectedClass := classContextSpecific
-		if params.application {
-			expectedClass = classApplication
-		}
-		if t.class == expectedClass && t.tag == *params.tag && (t.length == 0 || t.isCompound) {
-			if t.length > 0 {
-				t, offset, err = parseTagAndLength(bytes, offset)
-				if err != nil {
-					return
-				}
-			} else {
-				if fieldType != flagType {
-					err = StructuralError{"Zero length explicit tag was not an asn1.Flag"}
-					return
-				}
-				v.SetBool(true)
-				return
-			}
-		} else {
-			// The tags didn't match, it might be an optional element.
-			ok := setDefaultValue(v, params)
-			if ok {
-				offset = initOffset
-			} else {
-				err = StructuralError{"explicitly tagged member didn't match"}
-			}
-			return
-		}
 	}
 
 	// Special case for strings: all the ASN.1 string types map to the Go
@@ -596,6 +622,10 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 	// Go type time.Time.
 	if universalTag == tagUTCTime && t.tag == tagGeneralizedTime {
 		universalTag = tagGeneralizedTime
+	}
+
+	if universalTag == tagSequence && params.set {
+		universalTag = tagSet
 	}
 
 	expectedClass := classUniversal
@@ -622,10 +652,7 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 		}
 		return
 	}
-	if invalidLength(offset, t.length, len(bytes)) {
-		err = SyntaxError{"data truncated"}
-		return
-	}
+
 	innerBytes := bytes[offset : offset+t.length]
 	offset += t.length
 
@@ -696,6 +723,34 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 		}
 		err = err1
 		return
+	case reflect.Uint:
+		parsedUint, err1 := parseUint64(innerBytes)
+		if err1 != nil {
+			err = err1
+		} else if uint64(uint(parsedUint)) != parsedUint {
+			err = StructuralError{"integer too large"}
+		} else {
+			val.SetUint(parsedUint)
+		}
+		return
+	case reflect.Uint32:
+		parsedUint, err1 := parseUint64(innerBytes)
+		if err1 != nil {
+			err = err1
+		} else if uint64(uint32(parsedUint)) != parsedUint {
+			err = StructuralError{"integer too large"}
+		} else {
+			val.SetUint(parsedUint)
+		}
+		return
+	case reflect.Uint64:
+		parsedUint, err1 := parseUint64(innerBytes)
+		if err1 != nil {
+			err = err1
+		} else {
+			val.SetUint(parsedUint)
+		}
+		return
 	// TODO(dfc) Add support for the remaining integer types
 	case reflect.Struct:
 		structType := fieldType
@@ -710,6 +765,10 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 		for i := 0; i < structType.NumField(); i++ {
 			field := structType.Field(i)
 			if i == 0 && field.Type == rawContentsType {
+				continue
+			}
+			// Skip over hidden non-exported fields
+			if field.PkgPath != "" {
 				continue
 			}
 			innerOffset, err = parseField(val.Field(i), innerBytes, innerOffset, parseFieldParameters(field.Tag.Get("asn1")))
@@ -746,11 +805,7 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 		case tagUTF8String:
 			v, err = parseUTF8String(innerBytes)
 		case tagGeneralString:
-			// GeneralString is specified in ISO-2022/ECMA-35,
-			// A brief review suggests that it includes structures
-			// that allow the encoding to change midstring and
-			// such. We give up and pass it as an 8-bit string.
-			v, err = parseT61String(innerBytes)
+			v, err = parseGeneralString(innerBytes)
 		default:
 			err = SyntaxError{fmt.Sprintf("internal error: unknown string type %d", universalTag)}
 		}
@@ -777,6 +832,8 @@ func setDefaultValue(v reflect.Value, params fieldParameters) (ok bool) {
 	switch val := v; val.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		val.SetInt(*params.defaultValue)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		val.SetUint(uint64(*params.defaultValue))
 	}
 	return
 }

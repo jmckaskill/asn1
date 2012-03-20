@@ -43,6 +43,10 @@ const (
 	classPrivate         = 3
 )
 
+const (
+	maxLength = (1 << 31) - 1
+)
+
 type tagAndLength struct {
 	class, tag, length int
 	isCompound         bool
@@ -74,6 +78,7 @@ type fieldParameters struct {
 	defaultValue *int64 // a default value for INTEGER typed fields (maybe nil).
 	tag          *int   // the EXPLICIT or IMPLICIT tag (maybe nil).
 	stringType   int    // the string tag to use when marshaling.
+	timeType     int    // the time tag to use when marshaling.
 	set          bool   // true iff this should be encoded as a SET
 
 	// Invariants:
@@ -86,6 +91,8 @@ type fieldParameters struct {
 func parseFieldParameters(str string) (ret fieldParameters) {
 	for _, part := range strings.Split(str, ",") {
 		switch {
+		case part == "generalized":
+			ret.timeType = tagGeneralizedTime
 		case part == "optional":
 			ret.optional = true
 		case part == "explicit":
@@ -93,6 +100,8 @@ func parseFieldParameters(str string) (ret fieldParameters) {
 			if ret.tag == nil {
 				ret.tag = new(int)
 			}
+		case part == "general":
+			ret.stringType = tagGeneralString
 		case part == "ia5":
 			ret.stringType = tagIA5String
 		case part == "printable":
@@ -139,7 +148,7 @@ func getUniversalType(t reflect.Type) (tagNumber int, isCompound, ok bool) {
 	switch t.Kind() {
 	case reflect.Bool:
 		return tagBoolean, false, true
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+	case reflect.Int, reflect.Uint, reflect.Int8, reflect.Uint8, reflect.Int16, reflect.Uint16, reflect.Int32, reflect.Uint32, reflect.Int64, reflect.Uint64:
 		return tagInteger, false, true
 	case reflect.Struct:
 		return tagSequence, true, true
