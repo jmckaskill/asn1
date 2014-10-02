@@ -409,12 +409,12 @@ func parseTagAndLength(bytes []byte, initOffset int) (ret tagAndLength, offset i
 				err = SyntaxError{"truncated tag or length"}
 				return
 			}
+			b = bytes[offset]
+			offset++
 			if ret.length > (maxLength >> 8) {
 				err = StructuralError{"length too large"}
 				return
 			}
-			b = bytes[offset]
-			offset++
 			ret.length <<= 8
 			ret.length |= int(b)
 		}
